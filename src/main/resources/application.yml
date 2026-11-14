@@ -20,6 +20,11 @@ spring:
           model: ${GROQ_MODEL:openai/gpt-oss-120b}
           temperature: 0.7
 
+chat:
+  # system-prompt defaults to a concise, helpful assistant prompt (see ChatProperties)
+  history-window: 20
+  max-input-chars: 8000
+
 management:
   endpoints:
     web:

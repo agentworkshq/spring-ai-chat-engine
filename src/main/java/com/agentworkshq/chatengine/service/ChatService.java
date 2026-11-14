@@ -3,14 +3,17 @@ package com.agentworkshq.chatengine.service;
 import java.util.List;
 import java.util.UUID;
 
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import com.agentworkshq.chatengine.config.ChatProperties;
 import com.agentworkshq.chatengine.dto.MessageResponse;
 import com.agentworkshq.chatengine.entity.Conversation;
 import com.agentworkshq.chatengine.entity.Message;
 import com.agentworkshq.chatengine.entity.MessageRole;
+import com.agentworkshq.chatengine.exception.InvalidRequestException;
 import com.agentworkshq.chatengine.exception.NotFoundException;
 import com.agentworkshq.chatengine.repository.ConversationRepository;
 import com.agentworkshq.chatengine.repository.MessageRepository;
@@ -26,17 +29,26 @@ public class ChatService {
 	private final ConversationRepository conversations;
 	private final MessageRepository messages;
 	private final LlmClient llmClient;
+	private final PromptPlanner promptPlanner;
+	private final ChatProperties properties;
 	private final TransactionTemplate tx;
 
 	public ChatService(ConversationRepository conversations, MessageRepository messages, LlmClient llmClient,
-			PlatformTransactionManager transactionManager) {
+			PromptPlanner promptPlanner, ChatProperties properties, PlatformTransactionManager transactionManager) {
 		this.conversations = conversations;
 		this.messages = messages;
 		this.llmClient = llmClient;
+		this.promptPlanner = promptPlanner;
+		this.properties = properties;
 		this.tx = new TransactionTemplate(transactionManager);
 	}
 
 	public MessageResponse sendMessage(UUID conversationId, String content) {
+		if (content.length() > properties.maxInputChars()) {
+			throw new InvalidRequestException(
+					"content must be at most " + properties.maxInputChars() + " characters");
+		}
+
 		// Transaction 1: persist the user message and snapshot everything the LLM call needs.
 		TurnContext turn = tx.execute(status -> {
 			Conversation conversation = conversations.findById(conversationId)
@@ -46,10 +58,10 @@ public class ChatService {
 					.role(MessageRole.USER)
 					.content(content)
 					.build());
-			List<LlmMessage> history = messages.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
-					.map(m -> new LlmMessage(m.getRole(), m.getContent()))
-					.toList();
-			return new TurnContext(history, conversation.getSystemPrompt(), conversation.getModel(),
+			List<Message> recent = messages.findByConversationIdOrderByCreatedAtDesc(conversationId,
+					PageRequest.of(0, promptPlanner.historyWindow()));
+			return new TurnContext(promptPlanner.history(recent),
+					promptPlanner.systemPrompt(conversation.getSystemPrompt()), conversation.getModel(),
 					conversation.getTemperature());
 		});
 

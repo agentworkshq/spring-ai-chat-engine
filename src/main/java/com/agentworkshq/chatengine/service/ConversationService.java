@@ -56,10 +56,25 @@ public class ConversationService {
 	}
 
 	@Transactional
-	public ConversationSummaryResponse updateTitle(UUID id, UpdateConversationRequest request) {
+	public ConversationSummaryResponse update(UUID id, UpdateConversationRequest request) {
 		Conversation conversation = find(id);
-		conversation.setTitle(request.title().trim());
+		if (request.title() != null) {
+			conversation.setTitle(request.title().trim());
+		}
+		if (request.systemPrompt() != null) {
+			conversation.setSystemPrompt(blankToNull(request.systemPrompt()));
+		}
+		if (request.model() != null) {
+			conversation.setModel(blankToNull(request.model()));
+		}
+		if (request.temperature() != null) {
+			conversation.setTemperature(request.temperature());
+		}
 		return ConversationSummaryResponse.from(conversations.saveAndFlush(conversation));
+	}
+
+	private static String blankToNull(String value) {
+		return value.isBlank() ? null : value.trim();
 	}
 
 	@Transactional

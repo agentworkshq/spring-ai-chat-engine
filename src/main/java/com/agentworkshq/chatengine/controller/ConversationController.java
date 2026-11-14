@@ -49,9 +49,9 @@ public class ConversationController {
 	}
 
 	@PatchMapping("/{id}")
-	public ConversationSummaryResponse updateTitle(@PathVariable UUID id,
+	public ConversationSummaryResponse update(@PathVariable UUID id,
 			@Valid @RequestBody UpdateConversationRequest request) {
-		return service.updateTitle(id, request);
+		return service.update(id, request);
 	}
 
 	@DeleteMapping("/{id}")
