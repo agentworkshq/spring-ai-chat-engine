@@ -13,7 +13,10 @@ account is involved and the provider sits behind a small `LlmClient` interface.
 ## Contents
 
 - [Features](#features)
-- [Architecture](#architecture)
+- [Design](#design)
+  - [High-level design (HLD)](#high-level-design-hld)
+  - [Low-level design (LLD)](#low-level-design-lld)
+  - [Flow diagrams](#flow-diagrams)
 - [Tech stack](#tech-stack)
 - [Quick start with Docker Compose](#quick-start-with-docker-compose)
 - [Configuration](#configuration)
@@ -49,7 +52,16 @@ account is involved and the provider sits behind a small `LlmClient` interface.
 - **Ready to ship**: layered, non-root Docker image with a health check, Docker Compose stack and a
   GitHub Actions pipeline.
 
-## Architecture
+## Design
+
+This section describes the system at three levels: the [high-level design](#high-level-design-hld)
+(components and deployment), the [low-level design](#low-level-design-lld) (classes, data model,
+exceptions) and the [flow diagrams](#flow-diagrams) (how requests, streaming, retries and prompts
+actually behave). Everything here reflects the code in `src/main`.
+
+### High-level design (HLD)
+
+#### Component view
 
 ```mermaid
 flowchart LR
@@ -81,7 +93,290 @@ flowchart LR
     Repos --> PG[("PostgreSQL 16")]
 ```
 
-The flow of one message (`POST /api/v1/conversations/{id}/messages`):
+| Layer | Components | Responsibility |
+| --- | --- | --- |
+| Servlet filters | `RequestIdFilter`, `ApiKeyAuthFilter`, `RateLimitFilter` | Cross-cutting concerns that run before Spring MVC: request correlation, optional authentication, per-IP rate limiting. |
+| Controllers | `ConversationController`, `MessageController` | HTTP mapping and request validation only. No business logic. |
+| Services | `ConversationService`, `ChatService`, `PromptPlanner` | Conversation CRUD; the chat turn (transactions, prompt assembly, model call, persistence); pure prompt rules. |
+| Provider abstraction | `LlmClient` (interface), `GroqLlmClient`, `LlmErrorMapper` | One small interface in front of the model provider; translation of provider failures into the app's own exceptions. |
+| Persistence | `ConversationRepository`, `MessageRepository`, Flyway | Spring Data JPA repositories; schema owned by Flyway migrations, validated (not generated) by Hibernate. |
+| Error handling | `GlobalExceptionHandler`, `ErrorResponseWriter` | One error body for everything, from controllers (`@RestControllerAdvice`) and from filters. |
+
+#### Deployment view
+
+```mermaid
+flowchart LR
+    User(["Client: curl, Swagger UI, your own app"])
+
+    subgraph Host["Docker Compose"]
+        subgraph AppC["app container: non-root, JVM 21, health check"]
+            Boot["Spring Boot application<br/>port 8080"]
+        end
+        subgraph PgC["postgres container: postgres 16 alpine"]
+            PG[("PostgreSQL<br/>port 5432")]
+        end
+        Vol[("named volume<br/>postgres_data")]
+    end
+
+    Groq(["Groq API<br/>api.groq.com/openai/v1"])
+
+    User -->|"HTTP 8080"| Boot
+    Boot -->|"JDBC"| PG
+    PG --- Vol
+    Boot -->|"HTTPS"| Groq
+```
+
+The `app` service starts only after PostgreSQL reports healthy. Configuration (the Groq key, model,
+database credentials, limits) reaches the container as environment variables; see
+[Configuration](#configuration).
+
+#### Key design decisions
+
+| Decision | Reason |
+| --- | --- |
+| The provider sits behind the `LlmClient` interface. | Services never see a vendor type, so providers can be added or swapped, and every test can use a fake instead of calling Groq. |
+| Two short transactions per chat turn, **none** around the model call. | A model call can take seconds; holding a database connection that long would exhaust the pool under load. |
+| Retries and timeouts are configured on the Spring AI client, and failures are mapped once, afterwards. | The underlying client already implements exponential backoff and `Retry-After`; the app only decides what the final failure means to its callers. |
+| Errors have one body and generic messages. | Clients can rely on one shape, and keys or raw provider output can never leak into a response or a log. |
+| History is limited by a sliding window read with a bounded query (newest N). | A conversation can grow without bound, but each model call and each database read stays small. |
+| A streamed reply is saved only when the stream completes. | A dropped connection or a failure mid-stream must not leave a half-written assistant message in the history. |
+| Small servlet filters instead of Spring Security. | The needs (a shared key, a per-IP limit, a request id) are narrow; a full security framework would add far more surface than value. |
+| Flyway owns the schema; Hibernate runs in `validate` mode. | Schema changes are explicit, reviewed migrations, and the app refuses to start if entities and tables disagree. |
+
+### Low-level design (LLD)
+
+#### Class diagram
+
+```mermaid
+classDiagram
+    direction LR
+
+    class ConversationController {
+        +create(CreateConversationRequest)
+        +list()
+        +get(UUID)
+        +update(UUID, UpdateConversationRequest)
+        +delete(UUID)
+    }
+    class MessageController {
+        +send(UUID, SendMessageRequest)
+        +stream(UUID, SendMessageRequest)
+    }
+    class ConversationService {
+        +create(request)
+        +list()
+        +get(id)
+        +update(id, request)
+        +delete(id)
+    }
+    class ChatService {
+        +sendMessage(conversationId, content)
+        +streamMessage(conversationId, content)
+        -beginTurn(conversationId, content)
+        -saveAssistantMessage(conversationId, reply)
+    }
+    class PromptPlanner {
+        +systemPrompt(conversationPrompt)
+        +historyWindow()
+        +history(newestFirst)
+    }
+    class LlmClient {
+        <<interface>>
+        +complete(messages, systemPrompt, model, temperature)
+        +stream(messages, systemPrompt, model, temperature)
+    }
+    class GroqLlmClient {
+        -ChatClient chatClient
+        +complete(...)
+        +stream(...)
+    }
+    class LlmErrorMapper {
+        <<utility>>
+        +map(Throwable) LlmException
+    }
+    class ConversationRepository {
+        <<interface>>
+    }
+    class MessageRepository {
+        <<interface>>
+        +findByConversationIdOrderByCreatedAtAsc(id)
+        +findByConversationIdOrderByCreatedAtDesc(id, pageable)
+    }
+    class Conversation {
+        UUID id
+        String title
+        String systemPrompt
+        String model
+        Double temperature
+        Instant createdAt
+        Instant updatedAt
+    }
+    class Message {
+        UUID id
+        MessageRole role
+        String content
+        Instant createdAt
+    }
+    class MessageRole {
+        <<enumeration>>
+        USER
+        ASSISTANT
+        SYSTEM
+    }
+    class ChatProperties {
+        <<record>>
+        String systemPrompt
+        int historyWindow
+        int maxInputChars
+    }
+
+    ConversationController --> ConversationService
+    MessageController --> ChatService
+    ConversationService --> ConversationRepository
+    ConversationService --> MessageRepository
+    ChatService --> PromptPlanner
+    ChatService --> LlmClient
+    ChatService --> ConversationRepository
+    ChatService --> MessageRepository
+    ChatService --> ChatProperties
+    PromptPlanner --> ChatProperties
+    GroqLlmClient ..|> LlmClient
+    GroqLlmClient ..> LlmErrorMapper
+    ConversationRepository ..> Conversation
+    MessageRepository ..> Message
+    Message "many" --> "1" Conversation
+    Message --> MessageRole
+```
+
+| Class | Notes |
+| --- | --- |
+| `ChatService` | Not `@Transactional` on purpose. It runs its two database steps through a `TransactionTemplate`, so no transaction can span the model call. |
+| `PromptPlanner` | Holds only rules and no I/O: the conversation's system prompt wins unless blank, and `history` turns the newest-first query result into a chronological window of at most `chat.history-window` messages. |
+| `GroqLlmClient` | Builds the Spring AI prompt (system message first), applies only the model and temperature a conversation actually sets, and calls `ChatClient` (`call()` or `stream()`). It does not log provider failures. |
+| `LlmErrorMapper` | Walks the cause chain of whatever the SDK threw and returns the matching `LlmException`. It never copies SDK messages, because those embed the provider's response body. |
+| `Conversation`, `Message` | JPA entities with UUID ids, `Instant` timestamps set in `@PrePersist` and `@PreUpdate`, and a lazy `ManyToOne` from message to conversation. |
+
+#### Data model
+
+```mermaid
+erDiagram
+    CONVERSATIONS ||--o{ MESSAGES : "has, deleted together"
+
+    CONVERSATIONS {
+        uuid id PK
+        varchar title "not null, max 200 by validation"
+        text system_prompt "nullable"
+        varchar model "nullable"
+        double temperature "nullable"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    MESSAGES {
+        uuid id PK
+        uuid conversation_id FK "on delete cascade"
+        varchar role "USER, ASSISTANT or SYSTEM"
+        text content
+        timestamptz created_at
+    }
+```
+
+`messages` has an index on `(conversation_id, created_at)`, which serves both history queries (the
+whole conversation oldest first, and the newest N for the prompt window). The schema is created by
+`V1__init.sql`; deleting a conversation removes its messages through the foreign key's
+`ON DELETE CASCADE`.
+
+#### Servlet filter chain
+
+Filters run in this order, before Spring MVC sees the request:
+
+| Order | Filter | Applies to | Effect |
+| --- | --- | --- | --- |
+| 1 | `RequestIdFilter` | every request | Accepts a safe `X-Request-Id` or generates a UUID, puts it in the logging MDC and the response header. |
+| 2 | `ApiKeyAuthFilter` | every request except health and the OpenAPI docs, **only when `API_KEY_ENABLED=true`** | Compares `X-API-Key` in constant time; answers `401` otherwise. |
+| 3 | `RateLimitFilter` | `POST .../messages` and `POST .../messages/stream`, unless disabled | One Bucket4j token bucket per client IP; answers `429` with `Retry-After` when empty. |
+
+Authentication runs before the rate limiter so that unauthenticated traffic cannot use up a real
+client's allowance. Filters write their errors with `ErrorResponseWriter`, which produces the same
+body as the `@RestControllerAdvice`.
+
+#### Configuration beans
+
+| Properties record | Prefix | Used by |
+| --- | --- | --- |
+| `ChatProperties` | `chat` | `PromptPlanner`, `ChatService` (system prompt, history window, maximum input length) |
+| `LlmProperties` | `chat.llm` | `LlmClientConfig` (connect and read timeouts, maximum attempts) |
+| `RateLimitProperties` | `rate-limit` | `RateLimiter`, `RateLimitFilter` |
+| `ApiKeyProperties` | `security.api-key` | `ApiKeyAuthFilter`, `OpenApiConfig` |
+
+`LlmClientConfig` applies the timeouts with an OkHttp interceptor on the Spring AI HTTP client and
+turns `chat.llm.max-attempts` into the client's retry count.
+
+#### Exception hierarchy
+
+```mermaid
+classDiagram
+    direction LR
+    RuntimeException <|-- NotFoundException
+    RuntimeException <|-- InvalidRequestException
+    RuntimeException <|-- LlmException
+    LlmException <|-- LlmRateLimitedException
+    LlmException <|-- LlmUnavailableException
+
+    class LlmException {
+        +Integer upstreamStatus
+        +Duration retryAfter
+    }
+```
+
+| Exception | Raised when | HTTP status |
+| --- | --- | --- |
+| `NotFoundException` | the conversation id does not exist | `404` |
+| `InvalidRequestException` | a message is longer than `chat.max-input-chars` | `400` |
+| `LlmRateLimitedException` | Groq answered `429` | `429`, with `Retry-After` if known |
+| `LlmUnavailableException` | Groq answered `408` or `5xx`, or timed out, or could not be reached | `503`, with `Retry-After` if known |
+| `LlmException` | Groq rejected the request (other `4xx`), or the response could not be parsed | `502` |
+
+Bean validation failures, malformed JSON and invalid ids are also `400`, and anything unexpected is a
+generic `500`. All use the same five-field body.
+
+### Flow diagrams
+
+#### 1. Request pipeline
+
+What happens to every request, from the socket to the response:
+
+```mermaid
+flowchart TD
+    Req([Incoming request]) --> RID["RequestIdFilter<br/>set X-Request-Id and log context"]
+    RID --> AuthOn{"API key auth<br/>enabled?"}
+    AuthOn -->|no| RLq
+    AuthOn -->|yes| Open{"Health or OpenAPI<br/>docs path?"}
+    Open -->|yes| RLq
+    Open -->|no| KeyOk{"X-API-Key<br/>valid?"}
+    KeyOk -->|no| R401["401 Unauthorized"]
+    KeyOk -->|yes| RLq
+    RLq{"POST to messages or<br/>messages/stream?"}
+    RLq -->|no| MVC
+    RLq -->|yes| RLon{"Rate limit<br/>enabled?"}
+    RLon -->|no| MVC
+    RLon -->|yes| Tok{"Token available<br/>for this IP?"}
+    Tok -->|no| R429["429 Too Many Requests<br/>with Retry-After"]
+    Tok -->|yes| MVC
+    MVC["Spring MVC: route to controller"] --> Val{"Request body and<br/>path valid?"}
+    Val -->|no| R400["400 Bad Request"]
+    Val -->|yes| Svc["Service logic"]
+    Svc --> Res{"Outcome"}
+    Res -->|success| R2xx["200, 201 or 204"]
+    Res -->|"error"| Adv["GlobalExceptionHandler<br/>maps to 400, 404, 429, 502, 503 or 500"]
+```
+
+Every response, including the error paths, carries the `X-Request-Id` header, because the request id
+filter runs first.
+
+#### 2. Sending a message
+
+The blocking endpoint, `POST /api/v1/conversations/{id}/messages`:
 
 ```mermaid
 sequenceDiagram
@@ -95,11 +390,14 @@ sequenceDiagram
 
     C->>MC: POST /api/v1/conversations/{id}/messages
     MC->>CS: sendMessage(id, content)
+    Note over CS: reject content longer than the limit (400)
     Note over CS,DB: Transaction 1 (short)
-    CS->>DB: save USER message, load last N messages
+    CS->>DB: find conversation (404 if missing)
+    CS->>DB: save USER message
+    CS->>DB: load newest N messages
     Note over CS,G: No database transaction is open during the model call
     CS->>L: complete(history, systemPrompt, model, temperature)
-    L->>G: chat completion (timeouts, retries on 429 / 5xx)
+    L->>G: chat completion (timeouts, retries on 429 and 5xx)
     G-->>L: reply
     L-->>CS: reply text
     Note over CS,DB: Transaction 2 (short)
@@ -108,8 +406,98 @@ sequenceDiagram
     MC-->>C: 201 Created
 ```
 
-The streaming endpoint follows the same steps, except the reply is emitted chunk by chunk and the
-assistant message is saved only when the stream completes.
+If the model call fails, the flow stops there: the user message is already saved, no assistant
+message is written, and the error is mapped as described in
+[exception hierarchy](#exception-hierarchy).
+
+#### 3. Streaming a reply
+
+`POST /api/v1/conversations/{id}/messages/stream`. Validation, the 404 check and saving the user
+message happen **before** the stream starts, so those failures are ordinary JSON errors. After that,
+three endings are possible:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant CS as ChatService
+    participant L as LlmClient
+    participant G as Groq API
+    participant DB as PostgreSQL
+
+    C->>CS: POST .../messages/stream
+    CS->>DB: validate, save USER message, load newest N (Transaction 1)
+    CS-->>C: 200 text/event-stream
+    CS->>L: stream(history, systemPrompt, model, temperature)
+    L->>G: streaming chat completion
+    loop for each chunk
+        G-->>L: chunk
+        L-->>CS: chunk (appended to an in-memory buffer)
+        CS-->>C: event token with the chunk
+    end
+    alt stream completes normally
+        CS->>DB: save ASSISTANT message with the full text (Transaction 2)
+        CS-->>C: event done with the saved message
+    else provider fails, the reply is empty, or saving it fails
+        CS-->>C: event error with a generic message
+        Note over CS,DB: nothing saved for the reply
+    else client disconnects
+        Note over CS,DB: stream cancelled, partial reply discarded, logged at INFO
+    end
+```
+
+#### 4. Calling the model: timeouts, retries and error mapping
+
+Retries happen inside the Spring AI client, before the app sees a failure. The mapping to the app's
+exceptions happens once, on the final outcome:
+
+```mermaid
+flowchart TD
+    Start([Call the model]) --> Send["Send request<br/>connect and read timeouts apply"]
+    Send --> Outcome{"Outcome"}
+    Outcome -->|"2xx, valid body"| OK([Reply returned])
+    Outcome -->|"2xx, body cannot be parsed"| E502
+    Outcome -->|"429, 408, 409, 5xx,<br/>timeout or connection error"| Left{"Attempts left?<br/>chat.llm.max-attempts"}
+    Outcome -->|"other 4xx"| NoRetry["Not retried:<br/>retrying cannot fix the request"]
+    Left -->|yes| Wait["Wait: Retry-After if sent,<br/>otherwise exponential backoff<br/>0.5s doubling, capped at 8s"]
+    Wait --> Send
+    Left -->|no| Map{"Final failure"}
+    NoRetry --> E502
+    Map -->|429| E429["LlmRateLimitedException<br/>HTTP 429 with Retry-After"]
+    Map -->|"408, 5xx, timeout,<br/>connection error"| E503["LlmUnavailableException<br/>HTTP 503"]
+    Map -->|"409"| E502
+    E502["LlmException<br/>HTTP 502"]
+```
+
+Whatever the failure, the error returned to the client is generic, and the server log gets one line
+with the exception type, the upstream status and any retry delay, never the provider's message.
+
+#### 5. Building the model request
+
+How `ChatService` and `PromptPlanner` turn a stored conversation into one model call:
+
+```mermaid
+flowchart TD
+    Conv([Conversation and new message]) --> SP{"Conversation has a<br/>non-blank system prompt?"}
+    SP -->|yes| UseConv["Use the conversation's prompt"]
+    SP -->|no| UseDef["Use the default prompt<br/>chat.system-prompt"]
+    UseConv --> Sys
+    UseDef --> Sys["System message goes first"]
+
+    Conv --> Q["Query newest N messages<br/>N = chat.history-window, includes the new one"]
+    Q --> Rev["Reverse into chronological order"]
+    Rev --> Hist["History: at most N messages<br/>older ones stay stored but are not sent"]
+
+    Conv --> M{"Conversation sets<br/>model or temperature?"}
+    M -->|yes| Over["Send the conversation's values"]
+    M -->|no| Def["Leave unset: server defaults<br/>GROQ_MODEL and temperature 0.7"]
+
+    Sys --> Req
+    Hist --> Req
+    Over --> Req
+    Def --> Req
+    Req(["LlmClient call:<br/>system prompt, history, model, temperature"])
+```
 
 ## Tech stack
 
