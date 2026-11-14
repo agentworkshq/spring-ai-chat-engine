@@ -1,10 +1,12 @@
 package com.agentworkshq.chatengine.service;
 
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -57,7 +59,14 @@ public class ChatService {
 		TurnContext turn = beginTurn(conversationId, content);
 
 		// No transaction (and no DB connection) held during the LLM call.
-		String reply = llmClient.complete(turn.history(), turn.systemPrompt(), turn.model(), turn.temperature());
+		String reply;
+		try {
+			reply = llmClient.complete(turn.history(), turn.systemPrompt(), turn.model(), turn.temperature());
+		}
+		catch (LlmException ex) {
+			logLlmFailure(conversationId, ex);
+			throw ex;
+		}
 
 		return saveAssistantMessage(conversationId, reply);
 	}
@@ -70,6 +79,8 @@ public class ChatService {
 	 */
 	public Flux<StreamEvent> streamMessage(UUID conversationId, String content) {
 		TurnContext turn = beginTurn(conversationId, content);
+		// Reactive callbacks run on other threads, so keep the request MDC (request id) for their logs.
+		Map<String, String> mdc = MDC.getCopyOfContextMap();
 
 		return Flux.defer(() -> {
 			StringBuilder reply = new StringBuilder();
@@ -79,10 +90,10 @@ public class ChatService {
 					.map(StreamEvent::token)
 					.concatWith(Mono.fromCallable(() -> StreamEvent.done(completeStream(conversationId, reply)))
 							.subscribeOn(Schedulers.boundedElastic()))
-					.onErrorResume(ex -> Mono.just(toErrorEvent(conversationId, ex)))
-					.doOnCancel(() -> log.info(
+					.onErrorResume(ex -> Mono.just(toErrorEvent(conversationId, ex, mdc)))
+					.doOnCancel(() -> withMdc(mdc, () -> log.info(
 							"Client disconnected mid-stream for conversation {}; discarding partial reply ({} chars)",
-							conversationId, reply.length()));
+							conversationId, reply.length())));
 		});
 	}
 
@@ -93,15 +104,38 @@ public class ChatService {
 		return saveAssistantMessage(conversationId, reply.toString());
 	}
 
-	private StreamEvent toErrorEvent(UUID conversationId, Throwable ex) {
-		if (ex instanceof LlmException) {
-			// The client already logged the provider detail it is allowed to log.
-			log.warn("Stream failed for conversation {}: {}; partial reply discarded", conversationId,
-					ex.getMessage());
-			return StreamEvent.error(ex.getMessage());
+	private StreamEvent toErrorEvent(UUID conversationId, Throwable ex, Map<String, String> mdc) {
+		if (ex instanceof LlmException llm) {
+			withMdc(mdc, () -> logLlmFailure(conversationId, llm));
+			return StreamEvent.error(llm.getMessage());
 		}
-		log.error("Stream failed for conversation {} while saving the reply", conversationId, ex);
+		withMdc(mdc, () -> log.error("Stream failed for conversation {} while saving the reply", conversationId, ex));
 		return StreamEvent.error("Failed to save the reply");
+	}
+
+	/** One log line per failed LLM call, built only from the safe fields (never provider text). */
+	private void logLlmFailure(UUID conversationId, LlmException ex) {
+		log.warn("LLM call failed for conversation {}: {} (upstream status: {}, retry-after: {}); nothing saved",
+				conversationId, ex.getClass().getSimpleName(),
+				ex.getUpstreamStatus() != null ? ex.getUpstreamStatus() : "none", ex.getRetryAfter());
+	}
+
+	private static void withMdc(Map<String, String> mdc, Runnable action) {
+		Map<String, String> previous = MDC.getCopyOfContextMap();
+		if (mdc != null) {
+			MDC.setContextMap(mdc);
+		}
+		try {
+			action.run();
+		}
+		finally {
+			if (previous != null) {
+				MDC.setContextMap(previous);
+			}
+			else {
+				MDC.clear();
+			}
+		}
 	}
 
 	/** Transaction 1: validate, persist the user message and snapshot everything the LLM call needs. */

@@ -1,10 +1,12 @@
 package com.agentworkshq.chatengine.exception;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -41,6 +43,19 @@ public class GlobalExceptionHandler {
 		return build(HttpStatus.BAD_REQUEST, ex.getMessage(), request);
 	}
 
+	/** Provider rate limit: 429, with Retry-After when the provider told us. */
+	@ExceptionHandler(LlmRateLimitedException.class)
+	ResponseEntity<ApiError> handleLlmRateLimited(LlmRateLimitedException ex, HttpServletRequest request) {
+		return build(HttpStatus.TOO_MANY_REQUESTS, ex.getMessage(), request, ex.getRetryAfter());
+	}
+
+	/** Provider down, overloaded or unreachable: 503, with Retry-After when known. */
+	@ExceptionHandler(LlmUnavailableException.class)
+	ResponseEntity<ApiError> handleLlmUnavailable(LlmUnavailableException ex, HttpServletRequest request) {
+		return build(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage(), request, ex.getRetryAfter());
+	}
+
+	/** Anything else wrong with the provider response (invalid payload, rejected request): 502. */
 	@ExceptionHandler(LlmException.class)
 	ResponseEntity<ApiError> handleLlm(LlmException ex, HttpServletRequest request) {
 		return build(HttpStatus.BAD_GATEWAY, ex.getMessage(), request);
@@ -79,9 +94,20 @@ public class GlobalExceptionHandler {
 	}
 
 	private ResponseEntity<ApiError> build(HttpStatus status, String message, HttpServletRequest request) {
+		return build(status, message, request, null);
+	}
+
+	private ResponseEntity<ApiError> build(HttpStatus status, String message, HttpServletRequest request,
+			Duration retryAfter) {
 		ApiError body = new ApiError(Instant.now(), status.value(), status.getReasonPhrase(), message,
 				request.getRequestURI());
 		// Explicit JSON so errors still render on endpoints that only produce text/event-stream.
-		return ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON).body(body);
+		ResponseEntity.BodyBuilder response = ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON);
+		if (retryAfter != null) {
+			// Retry-After is whole seconds; round up and never advertise 0.
+			long seconds = Math.max(1, (retryAfter.toMillis() + 999) / 1000);
+			response.header(HttpHeaders.RETRY_AFTER, Long.toString(seconds));
+		}
+		return response.body(body);
 	}
 }

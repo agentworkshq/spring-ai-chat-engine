@@ -28,6 +28,21 @@ chat:
   # system-prompt defaults to a concise, helpful assistant prompt (see ChatProperties)
   history-window: 20
   max-input-chars: 8000
+  llm:
+    connect-timeout: ${LLM_CONNECT_TIMEOUT:5s}
+    read-timeout: ${LLM_READ_TIMEOUT:60s}
+    # Total attempts per call (1 = no retries). Only transient failures are retried:
+    # 408/409/429/5xx, timeouts and connection errors, with exponential backoff.
+    max-attempts: ${LLM_MAX_ATTEMPTS:3}
+
+logging:
+  pattern:
+    # Adds the request id (set by RequestIdFilter) to every log line.
+    level: "%5p [%X{requestId:-}]"
+  level:
+    # On a failed stream this logger prints the raw provider error message and stack traces, which
+    # must never be logged. ChatService logs the failure once, from safe fields only.
+    org.springframework.ai.chat.model.MessageAggregator: "OFF"
 
 management:
   endpoints:
