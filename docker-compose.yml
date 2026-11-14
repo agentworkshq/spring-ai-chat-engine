@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME:-chatengine}
+      POSTGRES_USER: ${DB_USER:-chat}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-chat}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-chatengine}
+      SPRING_DATASOURCE_USERNAME: ${DB_USER:-chat}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-chat}
+      SPRING_AI_OPENAI_API_KEY: ${GROQ_API_KEY}
+      SPRING_AI_OPENAI_BASE_URL: https://api.groq.com/openai
+      SPRING_AI_OPENAI_CHAT_OPTIONS_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+
+volumes:
+  postgres_data:
