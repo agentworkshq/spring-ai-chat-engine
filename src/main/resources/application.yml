@@ -35,6 +35,18 @@ chat:
     # 408/409/429/5xx, timeouts and connection errors, with exponential backoff.
     max-attempts: ${LLM_MAX_ATTEMPTS:3}
 
+rate-limit:
+  # Per client IP, shared by POST .../messages and POST .../messages/stream.
+  # Behind a reverse proxy also set server.forward-headers-strategy=native so the real client IP is used.
+  enabled: ${RATE_LIMIT_ENABLED:true}
+  requests-per-minute: ${RATE_LIMIT_RPM:20}
+
+security:
+  api-key:
+    # When enabled, every request except health checks and the OpenAPI docs needs an X-API-Key header.
+    enabled: ${API_KEY_ENABLED:false}
+    value: ${API_KEY:}
+
 logging:
   pattern:
     # Adds the request id (set by RequestIdFilter) to every log line.
