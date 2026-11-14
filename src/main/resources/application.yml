@@ -11,6 +11,10 @@ spring:
     open-in-view: false
   flyway:
     enabled: true
+  mvc:
+    async:
+      # Streamed replies are async requests; the container default (30s) can cut off long generations.
+      request-timeout: 2m
   ai:
     openai:
       api-key: ${GROQ_API_KEY}

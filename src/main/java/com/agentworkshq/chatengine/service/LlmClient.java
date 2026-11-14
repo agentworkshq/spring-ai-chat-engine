@@ -4,6 +4,8 @@ import java.util.List;
 
 import com.agentworkshq.chatengine.entity.MessageRole;
 
+import reactor.core.publisher.Flux;
+
 /**
  * Abstraction over the chat model provider so the rest of the app (and tests) never depend on
  * a concrete vendor.
@@ -20,6 +22,12 @@ public interface LlmClient {
 	 * @throws com.agentworkshq.chatengine.exception.LlmException if the provider call fails
 	 */
 	String complete(List<LlmMessage> messages, String systemPrompt, String model, Double temperature);
+
+	/**
+	 * Same as {@link #complete} but emits the reply as it is generated. Provider failures are
+	 * signalled as an {@link com.agentworkshq.chatengine.exception.LlmException} error.
+	 */
+	Flux<String> stream(List<LlmMessage> messages, String systemPrompt, String model, Double temperature);
 
 	record LlmMessage(MessageRole role, String content) {
 	}
