@@ -1,0 +1,27 @@
+spring:
+  application:
+    name: spring-ai-chat-engine
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/${DB_NAME:chatengine}}
+    username: ${SPRING_DATASOURCE_USERNAME:${DB_USER:chat}}
+    password: ${SPRING_DATASOURCE_PASSWORD:${DB_PASSWORD:chat}}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+  ai:
+    openai:
+      api-key: ${GROQ_API_KEY}
+      base-url: https://api.groq.com/openai
+      chat:
+        options:
+          model: ${GROQ_MODEL:llama-3.3-70b-versatile}
+          temperature: 0.7
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
