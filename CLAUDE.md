@@ -7,7 +7,7 @@ Backend-only conversational AI REST API.
 - Web starter is `spring-boot-starter-webmvc`
 - PostgreSQL 16, Flyway, Spring Data JPA, Lombok (never `@Data` on entities)
 - LLM: Groq via the OpenAI-compatible starter (`spring-ai-starter-model-openai`,
-  `spring.ai.openai.base-url=https://api.groq.com/openai`). No OpenAI account is used.
+  `spring.ai.openai.base-url=https://api.groq.com/openai/v1`). No OpenAI account is used.
 - Package: `com.agentworkshq.chatengine` with subpackages config, controller, service,
   repository, entity, dto, exception
 

@@ -28,6 +28,11 @@ public class GlobalExceptionHandler {
 		return build(HttpStatus.NOT_FOUND, ex.getMessage(), request);
 	}
 
+	@ExceptionHandler(LlmException.class)
+	ResponseEntity<ApiError> handleLlm(LlmException ex, HttpServletRequest request) {
+		return build(HttpStatus.BAD_GATEWAY, ex.getMessage(), request);
+	}
+
 	@ExceptionHandler(MethodArgumentNotValidException.class)
 	ResponseEntity<ApiError> handleValidation(MethodArgumentNotValidException ex, HttpServletRequest request) {
 		String details = ex.getBindingResult().getFieldErrors().stream()
