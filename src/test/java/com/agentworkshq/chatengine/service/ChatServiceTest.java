@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -17,6 +19,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.domain.Pageable;
@@ -28,6 +31,7 @@ import com.agentworkshq.chatengine.entity.Conversation;
 import com.agentworkshq.chatengine.entity.Message;
 import com.agentworkshq.chatengine.entity.MessageRole;
 import com.agentworkshq.chatengine.exception.InvalidRequestException;
+import com.agentworkshq.chatengine.exception.LlmUnavailableException;
 import com.agentworkshq.chatengine.exception.NotFoundException;
 import com.agentworkshq.chatengine.repository.ConversationRepository;
 import com.agentworkshq.chatengine.repository.MessageRepository;
@@ -148,6 +152,59 @@ class ChatServiceTest {
 		assertThatThrownBy(() -> service(20, 8000).sendMessage(id, "hi")).isInstanceOf(NotFoundException.class);
 
 		verifyNoInteractions(llmClient);
+	}
+
+	@Test
+	void savesTheUserMessageThenTheAssistantReplyOnTheSameConversation() {
+		Conversation conversation = conversation(null, null, null);
+		when(conversations.findById(id)).thenReturn(Optional.of(conversation));
+		when(messages.findByConversationIdOrderByCreatedAtDesc(eq(id), any(Pageable.class)))
+				.thenReturn(List.of(msg(MessageRole.USER, "question")));
+		when(llmClient.complete(any(), any(), any(), any())).thenReturn("answer");
+
+		MessageResponse reply = service(20, 8000).sendMessage(id, "question");
+
+		ArgumentCaptor<Message> saved = ArgumentCaptor.forClass(Message.class);
+		verify(messages, times(2)).save(saved.capture());
+		assertThat(saved.getAllValues()).extracting(Message::getRole)
+				.containsExactly(MessageRole.USER, MessageRole.ASSISTANT);
+		assertThat(saved.getAllValues()).extracting(Message::getContent).containsExactly("question", "answer");
+		assertThat(saved.getAllValues()).extracting(Message::getConversation).containsOnly(conversation);
+		assertThat(reply.role()).isEqualTo(MessageRole.ASSISTANT);
+		assertThat(reply.content()).isEqualTo("answer");
+	}
+
+	@Test
+	void modelFailureLeavesTheUserMessageSavedButNoReply() {
+		when(conversations.findById(id)).thenReturn(Optional.of(conversation(null, null, null)));
+		when(messages.findByConversationIdOrderByCreatedAtDesc(eq(id), any(Pageable.class)))
+				.thenReturn(List.of(msg(MessageRole.USER, "hi")));
+		when(llmClient.complete(any(), any(), any(), any())).thenThrow(new LlmUnavailableException(503, null));
+
+		assertThatThrownBy(() -> service(20, 8000).sendMessage(id, "hi"))
+				.isInstanceOf(LlmUnavailableException.class);
+
+		ArgumentCaptor<Message> saved = ArgumentCaptor.forClass(Message.class);
+		verify(messages, times(1)).save(saved.capture());
+		assertThat(saved.getValue().getRole()).isEqualTo(MessageRole.USER);
+	}
+
+	@Test
+	void noTransactionIsOpenWhileTheModelIsCalled() {
+		when(conversations.findById(id)).thenReturn(Optional.of(conversation(null, null, null)));
+		when(messages.findByConversationIdOrderByCreatedAtDesc(eq(id), any(Pageable.class)))
+				.thenReturn(List.of(msg(MessageRole.USER, "hi")));
+		when(llmClient.complete(any(), any(), any(), any())).thenReturn("ok");
+
+		service(20, 8000).sendMessage(id, "hi");
+
+		// First transaction commits before the model call; the second only begins after it returned.
+		InOrder order = inOrder(transactionManager, llmClient);
+		order.verify(transactionManager).getTransaction(any());
+		order.verify(transactionManager).commit(any());
+		order.verify(llmClient).complete(any(), any(), any(), any());
+		order.verify(transactionManager).getTransaction(any());
+		order.verify(transactionManager).commit(any());
 	}
 
 }
