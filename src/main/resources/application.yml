@@ -35,6 +35,18 @@ chat:
     # 408/409/429/5xx, timeouts and connection errors, with exponential backoff.
     max-attempts: ${LLM_MAX_ATTEMPTS:3}
 
+app:
+  # Filled in by Maven resource filtering; shown as the API version in the OpenAPI docs.
+  version: "@project.version@"
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    display-request-duration: true
+    tags-sorter: alpha
+
 rate-limit:
   # Per client IP, shared by POST .../messages and POST .../messages/stream.
   # Behind a reverse proxy also set server.forward-headers-strategy=native so the real client IP is used.
