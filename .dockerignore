@@ -4,3 +4,8 @@ target/
 .vscode/
 .env
 *.iml
+.github/
+HELP.md
+*.md
+docker-compose.yml
+Dockerfile
